@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Гайковёрт</title>
+<style>
+  :root{
+    --bg:#111; --card:#1e1e1e; --muted:#888;
+    --ok:#4ade80; --warn:#facc15; --fail:#ef4444;
+  }
+  body { font-family: system-ui, sans-serif; background:var(--bg); color:#eee; margin:0; padding:20px }
+  .toolbar{ display:flex; gap:10px; align-items:center; margin-bottom:16px; flex-wrap:wrap }
+  .toolbar label.btn{
+    background:#2a2a2a; color:#eee; padding:8px 14px; border-radius:8px;
+    cursor:pointer; border:1px solid #333; font-size:.9rem;
+  }
+  .toolbar label.btn:hover{ background:#333 }
+  .toolbar input[type=file]{ display:none }
+  .toolbar button{
+    background:#2a2a2a; color:#eee; padding:8px 14px; border-radius:8px;
+    border:1px solid #333; cursor:pointer; font-size:.9rem;
+  }
+  .toolbar button:hover{ background:#333 }
+  .toolbar .file-name{ color:var(--muted); font-size:.85rem }
+
+  .grid { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin-bottom:20px }
+  .card { background:var(--card); border-radius:10px; padding:16px; text-align:center }
+  .val { font-size:2rem; font-weight:700; color:var(--ok) }
+  .label { font-size:.8rem; color:var(--muted); text-transform:uppercase; letter-spacing:.05em }
+  #status.running { color:var(--warn) }
+  #status.ok      { color:var(--ok) }
+  #status.fail    { color:var(--fail) }
+  canvas { background:var(--card); border-radius:10px; width:100%; height:260px; display:block }
+
+  .log{ margin-top:16px; background:var(--card); border-radius:10px; padding:12px;
+        max-height:220px; overflow:auto; font-family:ui-monospace,monospace; font-size:.8rem }
+  .log div{ padding:2px 0; border-bottom:1px solid #2a2a2a }
+  .log .ok{ color:var(--ok) } .log .fail{ color:var(--fail) } .log .warn{ color:var(--warn) }
+</style>
+</head>
+<body>
+
+  <div class="toolbar">
+    <label class="btn" for="fileInput">📂 Загрузить CSV</label>
+    <input id="fileInput" type="file" accept=".csv,text/csv">
+    <button id="reloadBtn" title="Загрузить файл из той же папки (нужен локальный сервер)">🔄 Загрузить tightener_data.csv</button>
+    <span class="file-name" id="fileName">файл не выбран</span>
+    <button id="liveBtn" title="Переключить приём с WebSocket">▶ Live-режим</button>
+  </div>
+
+  <div class="grid">
+    <div class="card"><div class="label">Момент, Н·м</div><div class="val" id="torque">–</div></div>
+    <div class="card"><div class="label">Угол, °</div><div class="val" id="angle">–</div></div>
+    <div class="card"><div class="label">Обороты</div><div class="val" id="rpm">–</div></div>
+    <div class="card"><div class="label">Статус</div><div class="val" id="status">–</div></div>
+  </div>
+
+  <canvas id="chart"></canvas>
+  <div class="log" id="log"></div>
+
+<script>
+/* ============================================================
+   1. Хранение данных
+   ============================================================ */
+const MAX_POINTS = 300;
+const torqueHistory = [];      // массив чисел момента для графика
+let lastRow = null;            // последняя строка CSV
+
+const ctx = document.getElementById('chart').getContext('2d');
+
+/* ============================================================
+   2. Отрисовка графика
+   ============================================================ */
+function draw() {
+  const w = ctx.canvas.width  = ctx.canvas.clientWidth;
+  const h = ctx.canvas.height = ctx.canvas.clientHeight;
+
+  ctx.clearRect(0, 0, w, h);
+
+  // сетка
+  ctx.strokeStyle = '#2a2a2a';
+  ctx.lineWidth = 1;
+  for (let i = 1; i < 4; i++) {
+    const y = (h / 4) * i;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+  }
+
+  if (torqueHistory.length < 2) return;
+
+  const min = Math.min(...torqueHistory);
+  const max = Math.max(...torqueHistory);
+  const range = (max - min) || 1;
+
+  ctx.beginPath();
+  torqueHistory.forEach((v, i) => {
+    const x = i / (MAX_POINTS - 1) * w;
+    const y = h - (v - min) / range * (h - 30) - 15;
+    i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+  });
+  ctx.strokeStyle = '#4ade80';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  // подписи min/max
+  ctx.fillStyle = '#666';
+  ctx.font = '11px system-ui';
+  ctx.fillText(max.toFixed(2), 6, 14);
+  ctx.fillText(min.toFixed(2), 6, h - 6);
+}
+
+/* ============================================================
+   3. Классификация статуса → CSS-класс
+   ============================================================ */
+function statusClass(status) {
+  const s = (status || '').toLowerCase();
+  if (s.includes('успех') || s.includes('ok'))      return 'ok';
+  if (s.includes('авар')  || s.includes('ошиб')
+   || s.includes('вне доп') || s.includes('отказ')) return 'fail';
+  if (s.includes('начал') || s.includes('running')) return 'running';
+  return '';
+}
+
+function pushLog(msg, cls = '') {
+  const log = document.getElementById('log');
+  const div = document.createElement('div');
+  div.className = cls;
+  div.textContent = msg;
+  log.prepend(div);
+  while (log.children.length > 100) log.lastChild.remove();
+}
+
+/* ============================================================
+   4. Обновление UI по одной записи
+   ============================================================ */
+function applyRow(row, opts = {}) {
+  const { torque, angle, status, time } = row;
+
+  lastRow = row;
+
+  document.getElementById('torque').textContent =
+    torque !== '' ? Number(torque).toFixed(2) : '–';
+  document.getElementById('angle').textContent  =
+    angle  !== '' ? Number(angle).toFixed(2)  : '–';
+
+  // RPM в CSV нет — показываем «–», либо 0
+  document.getElementById('rpm').textContent = opts.rpm ?? '–';
+
+  const sEl = document.getElementById('status');
+  sEl.textContent = status || '–';
+  sEl.className = 'val ' + statusClass(status);
+
+  if (torque !== '' && !isNaN(Number(torque))) {
+    torqueHistory.push(Number(torque));
+    if (torqueHistory.length > MAX_POINTS) torqueHistory.shift();
+  }
+
+  if (time) pushLog(`${time} | T=${torque} | A=${angle} | ${status}`,
+                    statusClass(status));
+  draw();
+}
+
+/* ============================================================
+   5. Парсер CSV (разделитель ";", BOM, русские заголовки)
+   ============================================================ */
+function parseCSV(text) {
+  // убираем BOM
+  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+
+  const lines = text.split(/\r?\n/).filter(l => l.trim() !== '');
+  if (lines.length === 0) return [];
+
+  // Заголовок — ищем индексы колонок (на случай изменения порядка)
+  const header = lines[0].split(';').map(s => s.trim().toLowerCase());
+
+  const idx = {
+    time:   header.findIndex(h => h.includes('время')   || h === 'time'),
+    torque: header.findIndex(h => h.includes('момент')  || h === 'torque'),
+    angle:  header.findIndex(h => h.includes('угол')    || h === 'angle'),
+    status: header.findIndex(h => h.includes('статус')  || h === 'status'),
+  };
+
+  const rows = [];
+  for (let i = 1; i < lines.length; i++) {
+    const cols = lines[i].split(';');
+    rows.push({
+      time:   idx.time   >= 0 ? (cols[idx.time]   || '').trim() : '',
+      torque: idx.torque >= 0 ? (cols[idx.torque] || '').trim() : '',
+      angle:  idx.angle  >= 0 ? (cols[idx.angle]  || '').trim() : '',
+      status: idx.status >= 0 ? (cols[idx.status] || '').trim() : '',
+    });
+  }
+  return rows;
+}
+
+/* ============================================================
+   6. Загрузка CSV из input
+   ============================================================ */
+document.getElementById('fileInput').addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+
+  document.getElementById('fileName').textContent = file.name;
+
+  const text = await file.text();
+  const rows = parseCSV(text);
+
+  resetState();
+  pushLog(`📂 Загружено строк: ${rows.length} из «${file.name}»`, 'ok');
+
+  // Проигрываем все строки, чтобы построить историю графика и лог
+  rows.forEach(r => applyRow(r));
+
+  // В карточках оставляем последнее значение — applyRow уже это сделал
+  if (rows.length === 0) pushLog('⚠ Файл пуст или неверного формата', 'warn');
+});
+
+/* ============================================================
+   7. Загрузка tightener_data.csv с локального сервера
+   ============================================================ */
+document.getElementById('reloadBtn').addEventListener('click', async () => {
+  try {
+    const res = await fetch('tightener_data.csv', { cache: 'no-store' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+    const text = await res.text();
+    const rows = parseCSV(text);
+
+    resetState();
+    document.getElementById('fileName').textContent = 'tightener_data.csv';
+    pushLog(`🔄 Файл прочитан, строк: ${rows.length}`, 'ok');
+    rows.forEach(r => applyRow(r));
+  } catch (err) {
+    pushLog(`❌ Не удалось загрузить файл: ${err.message}. ` +
+            `Откройте страницу через локальный сервер ` +
+            `(python -m http.server) или загрузите CSV вручную.`, 'fail');
+  }
+});
+
+/* ============================================================
+   8. Live-режим через WebSocket (опционально)
+   ============================================================ */
+let ws = null;
+document.getElementById('liveBtn').addEventListener('click', () => {
+  if (ws) {
+    ws.close();
+    ws = null;
+    document.getElementById('liveBtn').textContent = '▶ Live-режим';
+    pushLog('⏹ WebSocket отключён', 'warn');
+    return;
+  }
+  try {
+    ws = new WebSocket(`ws://${location.host}/ws`);
+    document.getElementById('liveBtn').textContent = '⏹ Остановить Live';
+
+    ws.onopen  = () => pushLog('🟢 WebSocket подключён', 'ok');
+    ws.onclose = () => {
+      pushLog('🔴 WebSocket закрыт', 'warn');
+      ws = null;
+      document.getElementById('liveBtn').textContent = '▶ Live-режим';
+    };
+    ws.onerror = () => pushLog('⚠ Ошибка WebSocket', 'fail');
+
+    ws.onmessage = (e) => {
+      try {
+        const d = JSON.parse(e.data);
+        applyRow({
+          time:   d.time || new Date().toLocaleString('ru-RU'),
+          torque: d.torque ?? '',
+          angle:  d.angle  ?? '',
+          status: d.status ?? '',
+        }, { rpm: d.rpm ?? '–' });
+      } catch { /* ignore */ }
+    };
+  } catch (err) {
+    pushLog(`❌ Не удалось открыть WS: ${err.message}`, 'fail');
+  }
+});
+
+/* ============================================================
+   9. Сброс состояния перед новой загрузкой
+   ============================================================ */
+function resetState() {
+  torqueHistory.length = 0;
+  lastRow = null;
+  document.getElementById('torque').textContent = '–';
+  document.getElementById('angle').textContent  = '–';
+  document.getElementById('rpm').textContent    = '–';
+  const sEl = document.getElementById('status');
+  sEl.textContent = '–';
+  sEl.className = 'val';
+  document.getElementById('log').innerHTML = '';
+  draw();
+}
+
+/* ============================================================
+   10. Автоподхват при старте (если страница открыта сервером)
+   ============================================================ */
+window.addEventListener('load', () => {
+  draw();
+  // Мягкая попытка подтянуть файл рядом со страницей
+  fetch('tightener_data.csv', { cache: 'no-store' })
+    .then(r => r.ok ? r.text() : Promise.reject())
+    .then(text => {
+      const rows = parseCSV(text);
+      if (rows.length) {
+        document.getElementById('fileName').textContent = 'tightener_data.csv (авто)';
+        pushLog(`✅ Автозагрузка: строк ${rows.length}`, 'ok');
+        rows.forEach(r => applyRow(r));
+      }
+    })
+    .catch(() => { /* файла рядом нет — это нормально */ });
+});
+</script>
+</body>
+</html>

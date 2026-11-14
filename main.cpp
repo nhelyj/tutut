@@ -1,0 +1,496 @@
+#include <iostream>
+#include <vector>
+#include <string>
+#include <fstream>
+#include <iomanip>
+#include <ctime>
+#include <cmath>
+#include <limits>
+#include <clocale>
+#include <thread>
+#include <chrono>
+
+#ifdef _WIN32
+    #define NOMINMAX
+    #include <windows.h>
+#endif
+
+using namespace std;
+
+// Демонстрационная модель. Реальный привод не подключён.
+
+enum class Mode {
+    Automatic = 1, Manual, Setup, Diagnostic, Emergency
+};
+
+enum class Strategy {
+    Torque = 1, Angle, TorqueAngle, Gradient, Sequence
+};
+
+struct Recipe {
+    string name;
+    Strategy strategy;
+    double targetTorque;
+    double torqueTolerance;
+    double targetAngle;
+    double angleTolerance;
+    double speed;
+    int attempts;
+    int points;
+};
+
+struct LogEntry {
+    string time;
+    string event;
+    string result;
+};
+
+vector<LogEntry> journal;
+
+const string DATA_FILE = "tightener_data.csv";
+
+Mode mode = Mode::Manual;
+bool emergency = false;
+bool sensorsOK = true;
+bool communicationOK = true;
+
+double measuredTorque = 0;
+double measuredAngle = 0;
+int currentPoint = 1;
+
+// === Вспомогательная пауза ===
+void sleepMs(int ms) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+}
+
+string currentTime() {
+    time_t now = time(nullptr);
+    tm* t = localtime(&now);
+    char buffer[30];
+    strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", t);
+    return buffer;
+}
+
+void logEvent(string event, string result) {
+    journal.push_back({currentTime(), event, result});
+}
+
+void initDataFile() {
+    ifstream check(DATA_FILE);
+    bool exists = check.good();
+    check.close();
+
+    ofstream file(DATA_FILE, ios::trunc);
+    if (!file) {
+        cout << "Не удалось открыть/создать файл данных: "
+             << DATA_FILE << '\n';
+        return;
+    }
+    file << "Время;Момент (Н*м);Угол (град);Статус\n";
+    file.close();
+
+    if (exists) {
+        cout << "Файл данных " << DATA_FILE << " найден — очищен.\n";
+    } else {
+        cout << "Файл данных " << DATA_FILE << " создан.\n";
+    }
+}
+
+void saveMeasurement(double torque, double angle, const string& status) {
+    ofstream file(DATA_FILE, ios::app);
+    if (!file) {
+        cout << "Не удалось записать данные в файл.\n";
+        return;
+    }
+    file << currentTime() << ';'
+         << fixed << setprecision(2) << torque << ';'
+         << angle << ';'
+         << status << '\n';
+    file.close();
+}
+
+void showDataFile() {
+    ifstream file(DATA_FILE);
+    if (!file) {
+        cout << "Файл данных не найден.\n";
+        return;
+    }
+    cout << "\n=== ФАЙЛ ДАННЫХ (" << DATA_FILE << ") ===\n";
+    string line;
+    while (getline(file, line)) cout << line << '\n';
+    file.close();
+}
+
+string strategyName(Strategy s) {
+    switch (s) {
+        case Strategy::Torque: return "По моменту";
+        case Strategy::Angle: return "По углу";
+        case Strategy::TorqueAngle: return "Момент + угол";
+        case Strategy::Gradient: return "Градиент момента";
+        case Strategy::Sequence: return "Последовательность";
+    }
+    return "Неизвестно";
+}
+
+void showRecipe(const Recipe& r) {
+    cout << "\n--- Рецепт: " << r.name << " ---\n";
+    cout << "Стратегия: " << strategyName(r.strategy) << '\n';
+    cout << fixed << setprecision(2);
+    cout << "Момент: " << r.targetTorque
+         << " Н*м +/- " << r.torqueTolerance << '\n';
+    cout << "Угол: " << r.targetAngle
+         << " градусов +/- " << r.angleTolerance << '\n';
+    cout << "Скорость: " << r.speed << '\n';
+    cout << "Попыток: " << r.attempts << '\n';
+    cout << "Количество точек: " << r.points << '\n';
+}
+
+void configureTorque(Recipe& r) {
+    cout << "\n--- Настройка момента затяжки ---\n";
+    cout << "Рецепт: " << r.name << '\n';
+    cout << "Текущий целевой момент: "
+         << fixed << setprecision(2) << r.targetTorque << " Н*м\n";
+    cout << "Введите новый момент (Н*м, 0 < M <= 1000): ";
+
+    double value;
+    if (!(cin >> value)) {
+        cin.clear();
+        cin.ignore(numeric_limits<streamsize>::max(), '\n');
+        cout << "Некорректный ввод.\n";
+        return;
+    }
+    if (value <= 0 || value > 1000) {
+        cout << "Момент должен быть в диапазоне (0; 1000].\n";
+        return;
+    }
+    r.targetTorque = value;
+    logEvent("Настройка рецепта",
+             r.name + ": момент = " + to_string(value));
+    cout << "Новый целевой момент сохранён: "
+         << fixed << setprecision(2) << r.targetTorque << " Н*м\n";
+}
+
+void showStatus(const Recipe& r) {
+    cout << "\n=== СОСТОЯНИЕ ГАЙКОВЁРТА ===\n";
+    cout << "Режим: " << static_cast<int>(mode) << '\n';
+    cout << "Авария: " << (emergency ? "ДА" : "НЕТ") << '\n';
+    cout << "Датчики: " << (sensorsOK ? "Норма" : "Ошибка") << '\n';
+    cout << "Связь: " << (communicationOK ? "Норма" : "Ошибка") << '\n';
+    cout << "Рецепт: " << r.name << '\n';
+
+    cout << fixed << setprecision(2);
+    cout << "Целевой момент: " << r.targetTorque
+         << " Н*м +/- " << r.torqueTolerance << '\n';
+
+    cout << "Точка: " << currentPoint << "/" << r.points << '\n';
+    cout << "Последний момент: " << measuredTorque << " Н*м\n";
+    cout << "Последний угол: " << measuredAngle << " градусов\n";
+}
+
+void chooseMode() {
+    cout << "\n1. Автоматический\n2. Ручной\n3. Наладочный\n4. Диагностический\n5. Аварийный останов\n";
+    int choice;
+    cin >> choice;
+
+    if (choice == 5) {
+        emergency = true;
+        mode = Mode::Emergency;
+        logEvent("Аварийный останов", "Привод отключён");
+        saveMeasurement(measuredTorque, measuredAngle, "Аварийный останов");
+        cout << "АВАРИЯ! Запуск заблокирован.\n";
+        return;
+    }
+    if (choice < 1 || choice > 4) {
+        cout << "Неверный режим.\n";
+        return;
+    }
+    if (choice == 3) {
+        string password;
+        cout << "Пароль наладчика (демо: 2468): ";
+        cin >> password;
+        if (password != "2468") {
+            cout << "Доступ запрещён.\n";
+            logEvent("Вход", "Неверный пароль");
+            return;
+        }
+    }
+    mode = static_cast<Mode>(choice);
+    logEvent("Изменение режима", to_string(choice));
+    cout << "Режим изменён.\n";
+}
+
+// ================= ЗАТЯЖКА С ПРОГРЕССОМ И АНИМАЦИЕЙ =================
+void runTightening(const Recipe& r) {
+    if (emergency) {
+        cout << "Пуск запрещён: активна авария.\n";
+        return;
+    }
+    if (mode != Mode::Automatic && mode != Mode::Manual) {
+        cout << "Этот режим не разрешает запуск затяжки.\n";
+        return;
+    }
+    if (!sensorsOK || !communicationOK) {
+        cout << "Пуск запрещён: ошибка датчиков или связи.\n";
+        logEvent("Проверка пуска", "Ошибка датчиков/связи");
+        saveMeasurement(measuredTorque, measuredAngle,
+                        "Отказ: датчики/связь");
+        return;
+    }
+
+    cout << "\n=== ЦИКЛ ЗАТЯЖКИ ===\n";
+    cout << "Рецепт:   " << r.name << '\n';
+    cout << "Стратегия: " << strategyName(r.strategy) << '\n';
+    cout << fixed << setprecision(2);
+    cout << "Целевой момент:  " << r.targetTorque
+         << " Н*м +/- " << r.torqueTolerance << '\n';
+    cout << "Целевой угол:    " << r.targetAngle
+         << " градусов +/- " << r.angleTolerance << '\n';
+    cout << "Попыток: " << r.attempts << '\n';
+
+    logEvent("Цикл затяжки", "Начало");
+
+    bool success = false;
+
+    for (int attempt = 1; attempt <= r.attempts; attempt++) {
+        if (r.attempts > 1)
+            cout << "\n--- Попытка " << attempt << " из " << r.attempts << " ---\n";
+
+        // --- Анимация загрузки перед попыткой ---
+        cout << "Загрузка данных рецепта ";
+        for (int i = 0; i < 3; i++) { cout << '.' << flush; sleepMs(200); }
+        cout << " готово\n";
+
+        cout << "Инициализация привода    ";
+        for (int i = 0; i < 3; i++) { cout << '.' << flush; sleepMs(200); }
+        cout << " готово\n";
+
+        // --- Пошаговая имитация: гайка накручивается ---
+        // Финальные значения с небольшой погрешностью (как у датчика)
+        const double finalT = r.targetTorque * 0.99;
+        const double finalA = r.targetAngle  * 0.98;
+        const int STEPS = 25;
+
+        cout << "\nГайка накручивается:\n";
+        cout << "[....................]   0%  Момент:   0.00 Н*м  Угол:   0.00 град";
+
+        double torque = 0.0, angle = 0.0;
+        for (int i = 1; i <= STEPS; i++) {
+            torque = finalT * i / STEPS;
+            angle  = finalA * i / STEPS;
+
+            int percent = i * 100 / STEPS;
+            int filled  = percent / 5;   // 20 символов = 100%
+
+            cout << "\r["
+                 << string(filled, '#')
+                 << string(20 - filled, '.')
+                 << "] " << setw(3) << percent << "%"
+                 << "  Момент: " << setw(6) << torque << " Н*м"
+                 << "  Угол: " << setw(6) << angle  << " град"
+                 << flush;
+
+            sleepMs(60);   // 25 * 60 мс ≈ 1.5 с — видно движение
+        }
+        cout << "\n";
+
+        measuredTorque = torque;
+        measuredAngle  = angle;
+
+        // --- Что фактически произошло ---
+        cout << "\nГайка закручена.\n";
+        cout << "Момент достиг " << measuredTorque << " Н*м\n";
+        cout << "Угол поворота гайки: " << measuredAngle << " градусов\n";
+
+        // --- Проверка допусков ---
+        bool torqueOK = abs(measuredTorque - r.targetTorque)
+                        <= r.torqueTolerance;
+        bool angleOK  = abs(measuredAngle  - r.targetAngle)
+                        <= r.angleTolerance;
+
+        switch (r.strategy) {
+            case Strategy::Torque:
+                success = torqueOK;
+                break;
+            case Strategy::Angle:
+                success = angleOK;
+                break;
+            case Strategy::TorqueAngle:
+                success = torqueOK && angleOK;
+                break;
+            case Strategy::Gradient:
+                success = torqueOK;
+                cout << "Градиент: условная проверка.\n";
+                break;
+            case Strategy::Sequence:
+                success = torqueOK && currentPoint <= r.points;
+                break;
+        }
+
+        saveMeasurement(measuredTorque, measuredAngle,
+                        success ? "Успешно" : "Вне допуска");
+
+        if (success) break;
+
+        logEvent("Попытка затяжки", "Вне допуска");
+        cout << "Параметры вне допуска (момент="
+             << measuredTorque << " Н*м, угол="
+             << measuredAngle << " град).\n";
+        sleepMs(300);
+    }
+
+    if (success) {
+        cout << "\nУСПЕХ: затяжка прошла проверку.\n";
+        cout << "Итоговый момент: " << measuredTorque << " Н*м\n";
+        cout << "Итоговый угол:   " << measuredAngle << " градусов\n";
+        logEvent("Результат",
+                 "Успешно (" + to_string(measuredTorque) + " Н*м)");
+
+        currentPoint++;
+        if (currentPoint > r.points) currentPoint = 1;
+    } else {
+        cout << "\nОШИБКА: все попытки исчерпаны.\n";
+        cout << "Имитация привода отключена.\n";
+        emergency = true;
+        mode = Mode::Emergency;
+        logEvent("Авария", "Затяжка не прошла допуск");
+        saveMeasurement(measuredTorque, measuredAngle, "АВАРИЯ");
+    }
+}
+
+void diagnostics() {
+    cout << "\n=== ДИАГНОСТИКА ===\n";
+    cout << "Датчики: " << (sensorsOK ? "Норма" : "Ошибка") << '\n';
+    cout << "Связь: " << (communicationOK ? "Норма" : "Ошибка") << '\n';
+    cout << "Авария: " << (emergency ? "Активна" : "Нет") << '\n';
+    logEvent("Диагностика", "Проверка выполнена");
+}
+
+void showJournal() {
+    cout << "\n=== ЖУРНАЛ СОБЫТИЙ ===\n";
+    for (const auto& entry : journal) {
+        cout << entry.time << " | "
+             << entry.event << " | "
+             << entry.result << '\n';
+    }
+}
+
+void exportJournal() {
+    ofstream file("tightener_log.csv");
+    if (!file) {
+        cout << "Не удалось создать файл журнала.\n";
+        return;
+    }
+    file << "Время;Событие;Результат\n";
+    for (const auto& entry : journal) {
+        file << entry.time << ';'
+             << entry.event << ';'
+             << entry.result << '\n';
+    }
+    file.close();
+    cout << "Журнал сохранён в tightener_log.csv\n";
+    logEvent("Экспорт журнала", "CSV");
+}
+
+int main() {
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+    setlocale(LC_ALL, ".UTF-8");
+
+    initDataFile();
+
+    vector<Recipe> recipes = {
+        { "Стандартный",  Strategy::Torque,      10.0, 0.5,  90.0, 5.0, 100.0, 3, 1 },
+        { "Момент-угол",  Strategy::TorqueAngle, 15.0, 0.7, 120.0, 6.0,  80.0, 3, 4 }
+    };
+
+    int recipeIndex = 0;
+    logEvent("Система", "Запуск программы");
+
+    while (true) {
+        cout << "\n========== ГАЙКОВЁРТ ==========\n";
+        cout << "1. Состояние системы\n";
+        cout << "2. Выбрать рецепт\n";
+        cout << "3. Показать рецепт\n";
+        cout << "4. Запустить затяжку\n";
+        cout << "5. Выбрать режим\n";
+        cout << "6. Диагностика\n";
+        cout << "7. Журнал событий\n";
+        cout << "8. Экспорт журнала\n";
+        cout << "9. Сброс аварии\n";
+        cout << "10. Показать файл данных\n";
+        cout << "11. Настроить момент затяжки\n";
+        cout << "0. Выход\n";
+        cout << "Команда: ";
+
+        int command;
+        if (!(cin >> command)) {
+            cin.clear();
+            cin.ignore(numeric_limits<streamsize>::max(), '\n');
+            cout << "Введите число.\n";
+            continue;
+        }
+
+        switch (command) {
+            case 1: showStatus(recipes[recipeIndex]); break;
+
+            case 2:
+                cout << "1. Стандартный\n2. Момент-угол\n";
+                cout << "Рецепт: ";
+                cin >> recipeIndex;
+                if (recipeIndex < 1 || recipeIndex > 2) {
+                    cout << "Неверный номер.\n";
+                    recipeIndex = 0;
+                } else {
+                    recipeIndex--;
+                    logEvent("Выбор рецепта", recipes[recipeIndex].name);
+                    cout << "Текущий момент: "
+                         << fixed << setprecision(2)
+                         << recipes[recipeIndex].targetTorque << " Н*м\n";
+                    cout << "Изменить момент? (1 - да, 0 - нет): ";
+                    int edit;
+                    cin >> edit;
+                    if (edit == 1) configureTorque(recipes[recipeIndex]);
+                }
+                break;
+
+            case 3: showRecipe(recipes[recipeIndex]); break;
+            case 4: runTightening(recipes[recipeIndex]); break;
+            case 5: chooseMode(); break;
+            case 6: diagnostics(); break;
+            case 7: showJournal(); break;
+            case 8: exportJournal(); break;
+
+            case 9: {
+                if (!emergency) {
+                    cout << "Активной аварии нет.\n";
+                    break;
+                }
+                cout << "Подтвердите устранение причины аварии (1 - да, 0 - нет): ";
+                int confirm;
+                cin >> confirm;
+                if (confirm == 1) {
+                    emergency = false;
+                    mode = Mode::Manual;
+                    logEvent("Сброс аварии", "Подтверждён");
+                    saveMeasurement(measuredTorque, measuredAngle,
+                                    "Авария сброшена");
+                    cout << "Авария сброшена в программе.\n";
+                } else {
+                    cout << "Сброс отменён.\n";
+                }
+                break;
+            }
+
+            case 10: showDataFile(); break;
+            case 11: configureTorque(recipes[recipeIndex]); break;
+
+            case 0:
+                logEvent("Система", "Завершение программы");
+                cout << "Программа завершена.\n";
+                return 0;
+
+            default:
+                cout << "Неизвестная команда.\n";
+        }
+    }
+}
